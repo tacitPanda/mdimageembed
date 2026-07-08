@@ -114,34 +114,49 @@ def build_markdown_copy_path(markdown_file: Path, output_dir: Optional[Path] = N
     return output_dir / f"{markdown_file.stem}_copy{markdown_file.suffix}"
 
 
+def display_path(path: Path, base_dir: Path) -> str:
+    try:
+        return str(path.relative_to(base_dir))
+    except ValueError:
+        return str(path)
+
+
 def build_image_copy_name(image_path: Path, destination_dir: Path, base_dir: Path) -> str:
     return image_path.name
 
 
-def build_static_image_link(image_name: str) -> str:
-    return f"/assets/images/{image_name}"
+def build_static_image_link(image_name: str, destination_dir: Path, base_dir: Path) -> str:
+    try:
+        rel_destination = destination_dir.relative_to(base_dir)
+        target_path = str(rel_destination).replace("\\", "/")
+    except Exception:
+        target_path = destination_dir.name
+
+    if target_path:
+        return f"{target_path}/{image_name}"
+    return image_name
 
 
 def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: Path, destination_dir: Path, base_dir: Path) -> str:
     def replace_wiki(match: re.Match) -> str:
-        prefix, target, suffix = match.groups()
+        _, target, _ = match.groups()
         resolved = resolve_image_path(target, markdown_file, images_dir, base_dir)
         if resolved is None:
             return match.group(0)
         if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
             return match.group(0)
-        image_link = build_static_image_link(resolved.name)
-        return f"{prefix}{image_link}{suffix}"
+        image_link = build_static_image_link(resolved.name, destination_dir, base_dir)
+        return f"![Description of image]({image_link})"
 
     def replace_markdown(match: re.Match) -> str:
-        prefix, target, suffix = match.groups()
+        _, target, _ = match.groups()
         resolved = resolve_image_path(target, markdown_file, images_dir, base_dir)
         if resolved is None:
             return match.group(0)
         if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
             return match.group(0)
-        image_link = build_static_image_link(resolved.name)
-        return f"{prefix}{image_link}{suffix}"
+        image_link = build_static_image_link(resolved.name, destination_dir, base_dir)
+        return f"![Description of image]({image_link})"
 
     rewritten = wiki_link_pattern.sub(replace_wiki, markdown_text)
     return markdown_link_pattern.sub(replace_markdown, rewritten)
@@ -190,14 +205,14 @@ def main() -> None:
                 continue
 
             copied_for_file = True
-            image_copy_name = build_image_copy_name(image_path, destination_dir, base_dir)
             dest = destination_dir / image_path.name
             if dest.exists():
-                skipped.append((str(markdown_file.relative_to(base_dir)), image_path.name, "already_exists"))
+                skipped.append((display_path(markdown_file, base_dir), image_path.name, "already_exists"))
                 continue
 
+            # Preserve any existing files in the destination directory; only add new copies.
             shutil.copy2(image_path, dest)
-            copied.append((str(markdown_file.relative_to(base_dir)), image_path.name))
+            copied.append((display_path(markdown_file, base_dir), image_path.name))
 
         if copied_for_file:
             markdown_copy_path = build_markdown_copy_path(markdown_file, markdown_output_dir)
@@ -205,7 +220,7 @@ def main() -> None:
                 rewritten_text = rewrite_markdown_copy(text, markdown_file, images_dir, destination_dir, base_dir)
                 markdown_copy_path.parent.mkdir(parents=True, exist_ok=True)
                 markdown_copy_path.write_text(rewritten_text, encoding="utf-8")
-                markdown_copies.append((str(markdown_file.relative_to(base_dir)), markdown_copy_path.name))
+                markdown_copies.append((display_path(markdown_file, base_dir), markdown_copy_path.name))
 
     print(f"Using markdown path: {markdown_path}")
     print(f"Using images directory: {images_dir}")
