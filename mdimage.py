@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 import argparse
 import os
@@ -38,6 +39,13 @@ def parse_args() -> argparse.Namespace:
         "--markdown-output-dir",
         default=None,
         help="Directory where rewritten markdown copies will be saved (default: next to the original markdown file)",
+    )
+    parser.add_argument(
+        "-l",
+        "--link-style",
+        choices=["static", "absolute"],
+        default="absolute",
+        help="Choose whether rewritten image links use /assets/images/<name> or an absolute path (default: absolute)",
     )
     return parser.parse_args()
 
@@ -108,10 +116,12 @@ def get_destination_suffix(destination_dir: Path, base_dir: Path) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", folder_suffix).strip("._")
 
 
-def build_markdown_copy_path(markdown_file: Path, output_dir: Optional[Path] = None) -> Path:
+def build_markdown_copy_path(markdown_file: Path, output_dir: Optional[Path] = None, current_date: Optional[str] = None) -> Path:
+    date_prefix = current_date or date.today().strftime("%Y-%m-%d")
+    copied_name = f"{date_prefix}-{markdown_file.stem}{markdown_file.suffix}"
     if output_dir is None:
-        return markdown_file.with_name(f"{markdown_file.stem}_copy{markdown_file.suffix}")
-    return output_dir / f"{markdown_file.stem}_copy{markdown_file.suffix}"
+        return markdown_file.with_name(copied_name)
+    return output_dir / copied_name
 
 
 def display_path(path: Path, base_dir: Path) -> str:
@@ -125,19 +135,15 @@ def build_image_copy_name(image_path: Path, destination_dir: Path, base_dir: Pat
     return image_path.name
 
 
-def build_static_image_link(image_name: str, destination_dir: Path, base_dir: Path) -> str:
-    try:
-        rel_destination = destination_dir.relative_to(base_dir)
-        target_path = str(rel_destination).replace("\\", "/")
-    except Exception:
-        target_path = destination_dir.name
+def build_image_link(image_name: str, destination_dir: Path, link_style: str) -> str:
+    if link_style == "static":
+        return f"/assets/images/{image_name}"
 
-    if target_path:
-        return f"{target_path}/{image_name}"
-    return image_name
+    target_path = (destination_dir / image_name).resolve()
+    return str(target_path).replace("\\", "/")
 
 
-def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: Path, destination_dir: Path, base_dir: Path) -> str:
+def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: Path, destination_dir: Path, base_dir: Path, link_style: str) -> str:
     def replace_wiki(match: re.Match) -> str:
         _, target, _ = match.groups()
         resolved = resolve_image_path(target, markdown_file, images_dir, base_dir)
@@ -145,7 +151,7 @@ def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: P
             return match.group(0)
         if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
             return match.group(0)
-        image_link = build_static_image_link(resolved.name, destination_dir, base_dir)
+        image_link = build_image_link(resolved.name, destination_dir, link_style)
         return f"![Description of image]({image_link})"
 
     def replace_markdown(match: re.Match) -> str:
@@ -155,7 +161,7 @@ def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: P
             return match.group(0)
         if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
             return match.group(0)
-        image_link = build_static_image_link(resolved.name, destination_dir, base_dir)
+        image_link = build_image_link(resolved.name, destination_dir, link_style)
         return f"![Description of image]({image_link})"
 
     rewritten = wiki_link_pattern.sub(replace_wiki, markdown_text)
@@ -170,6 +176,8 @@ def main() -> None:
     images_dir = resolve_path(args.images_dir, base_dir)
     destination_dir = resolve_path(args.destination_dir, base_dir)
     markdown_output_dir = resolve_path(args.markdown_output_dir, base_dir) if args.markdown_output_dir else None
+    current_date = date.today().strftime("%Y-%m-%d")
+    link_style = args.link_style
 
     destination_dir.mkdir(parents=True, exist_ok=True)
 
@@ -177,6 +185,7 @@ def main() -> None:
     if not markdown_files:
         print(f"No markdown files found at: {markdown_path}")
         return
+    current_date = date.today().strftime("%Y-%m-%d")
 
     copied = []
     skipped = []
@@ -215,14 +224,15 @@ def main() -> None:
             copied.append((display_path(markdown_file, base_dir), image_path.name))
 
         if copied_for_file:
-            markdown_copy_path = build_markdown_copy_path(markdown_file, markdown_output_dir)
+            markdown_copy_path = build_markdown_copy_path(markdown_file, markdown_output_dir, current_date)
             if not markdown_copy_path.exists():
-                rewritten_text = rewrite_markdown_copy(text, markdown_file, images_dir, destination_dir, base_dir)
+                rewritten_text = rewrite_markdown_copy(text, markdown_file, images_dir, destination_dir, base_dir, link_style)
                 markdown_copy_path.parent.mkdir(parents=True, exist_ok=True)
                 markdown_copy_path.write_text(rewritten_text, encoding="utf-8")
                 markdown_copies.append((display_path(markdown_file, base_dir), markdown_copy_path.name))
 
     print(f"Using markdown path: {markdown_path}")
+    print(f"Current date: {current_date}")
     print(f"Using images directory: {images_dir}")
     print(f"Copy destination: {destination_dir}")
     print(f"Copied {len(copied)} file(s)")
