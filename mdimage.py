@@ -5,11 +5,14 @@ import os
 import re
 import shutil
 from typing import List, Optional, Set
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 
-wiki_link_pattern = re.compile(r"(!\[\[)([^\]\n]+?\.png)(\]\])")
-markdown_link_pattern = re.compile(r"(!\[[^\]]*\]\()([^\)\n]+?\.png)(\))")
+wiki_link_pattern = re.compile(r"(!\[\[)([^\]\n]+)(\]\])")
+markdown_link_pattern = re.compile(r"(!\[[^\]]*\]\()([^\)\n]+)(\))")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tif", ".tiff"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +50,13 @@ def parse_args() -> argparse.Namespace:
         default="absolute",
         help="Choose whether rewritten image links use /assets/images/<name> or an absolute path (default: absolute)",
     )
+    parser.add_argument(
+        "-s",
+        "--source-mode",
+        choices=["remote", "local"],
+        default="remote",
+        help="Choose whether to resolve image references from remote URLs or local files (default: remote)",
+    )
     return parser.parse_args()
 
 
@@ -65,13 +75,28 @@ def get_markdown_files(markdown_path: Path) -> List[Path]:
     return sorted([path for path in markdown_path.rglob("*.md") if path.is_file()])
 
 
+def is_image_reference(reference: str) -> bool:
+    candidate_text = reference.strip().strip("'\"")
+    if not candidate_text:
+        return False
+
+    parsed = urlparse(candidate_text)
+    if parsed.scheme in {"http", "https"}:
+        return True
+
+    suffix = Path(candidate_text).suffix.lower()
+    return suffix in IMAGE_EXTENSIONS
+
+
 def extract_image_references(markdown_text: str) -> Set[str]:
     refs = set()
     for match in wiki_link_pattern.finditer(markdown_text):
-        refs.add(match.group(2).strip())
+        target = match.group(2).strip()
+        if is_image_reference(target):
+            refs.add(target)
     for match in markdown_link_pattern.finditer(markdown_text):
         target = match.group(2).strip()
-        if target.lower().endswith(".png"):
+        if is_image_reference(target):
             refs.add(target)
     return refs
 
@@ -84,7 +109,7 @@ def resolve_image_path(reference: str, markdown_file: Path, images_dir: Path, ba
     candidate_path = Path(candidate_text)
 
     if candidate_path.is_absolute():
-        if candidate_path.exists() and candidate_path.is_file() and candidate_path.suffix.lower() == ".png":
+        if candidate_path.exists() and candidate_path.is_file() and candidate_path.suffix.lower() in IMAGE_EXTENSIONS:
             return candidate_path
         return None
 
@@ -95,15 +120,75 @@ def resolve_image_path(reference: str, markdown_file: Path, images_dir: Path, ba
     ]
 
     for location in search_locations:
-        if location.exists() and location.is_file() and location.suffix.lower() == ".png":
+        if location.exists() and location.is_file() and location.suffix.lower() in IMAGE_EXTENSIONS:
             return location
 
-    if candidate_path.suffix.lower() == ".png":
-        for match in images_dir.rglob("*.png"):
-            if match.name == candidate_path.name:
+    if candidate_path.suffix.lower() in IMAGE_EXTENSIONS:
+        for match in images_dir.rglob("*"):
+            if match.is_file() and match.name == candidate_path.name and match.suffix.lower() in IMAGE_EXTENSIONS:
                 return match
 
     return None
+
+
+def build_downloaded_image_name(reference: str, destination_dir: Path, base_dir: Path, current_date: Optional[str] = None) -> str:
+    date_prefix = current_date or date.today().strftime("%Y-%m-%d")
+    parsed = urlparse(reference)
+    file_name = Path(unquote(parsed.path)).name or "image"
+    stem = Path(file_name).stem
+    suffix = Path(file_name).suffix.lower() or ".bin"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "image"
+    return f"{date_prefix}-{safe_stem}{suffix}"
+
+
+def download_remote_image(reference: str, destination_dir: Path, base_dir: Path, current_date: Optional[str] = None) -> Optional[Path]:
+    if not is_image_reference(reference):
+        return None
+
+    downloaded_name = build_downloaded_image_name(reference, destination_dir, base_dir, current_date)
+    destination_path = destination_dir / downloaded_name
+    if destination_path.exists():
+        return destination_path
+
+    request = Request(reference, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if content_type and not content_type.lower().startswith("image/"):
+                return None
+            data = response.read()
+    except Exception:
+        return None
+
+    if not data:
+        return None
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    destination_path.write_bytes(data)
+    return destination_path
+
+
+def resolve_image_reference(
+    reference: str,
+    markdown_file: Path,
+    images_dir: Path,
+    destination_dir: Path,
+    base_dir: Path,
+    current_date: Optional[str] = None,
+    source_mode: str = "remote",
+) -> Optional[Path]:
+    candidate_text = reference.strip().strip("'\"")
+    if not candidate_text:
+        return None
+
+    is_remote = urlparse(candidate_text).scheme in {"http", "https"}
+    if is_remote and source_mode == "remote":
+        return download_remote_image(candidate_text, destination_dir, base_dir, current_date)
+
+    if is_remote and source_mode == "local":
+        return None
+
+    return resolve_image_path(candidate_text, markdown_file, images_dir, base_dir)
 
 
 def get_destination_suffix(destination_dir: Path, base_dir: Path) -> str:
@@ -143,23 +228,23 @@ def build_image_link(image_name: str, destination_dir: Path, link_style: str) ->
     return str(target_path).replace("\\", "/")
 
 
-def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: Path, destination_dir: Path, base_dir: Path, link_style: str) -> str:
+def rewrite_markdown_copy(markdown_text: str, markdown_file: Path, images_dir: Path, destination_dir: Path, base_dir: Path, link_style: str, current_date: Optional[str] = None) -> str:
     def replace_wiki(match: re.Match) -> str:
         _, target, _ = match.groups()
-        resolved = resolve_image_path(target, markdown_file, images_dir, base_dir)
+        resolved = resolve_image_reference(target, markdown_file, images_dir, destination_dir, base_dir, current_date)
         if resolved is None:
             return match.group(0)
-        if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
+        if resolved.parent != images_dir and resolved.parent != markdown_file.parent and resolved.parent != destination_dir:
             return match.group(0)
         image_link = build_image_link(resolved.name, destination_dir, link_style)
         return f"![Description of image]({image_link})"
 
     def replace_markdown(match: re.Match) -> str:
         _, target, _ = match.groups()
-        resolved = resolve_image_path(target, markdown_file, images_dir, base_dir)
+        resolved = resolve_image_reference(target, markdown_file, images_dir, destination_dir, base_dir, current_date)
         if resolved is None:
             return match.group(0)
-        if resolved.parent != images_dir and resolved.parent != markdown_file.parent:
+        if resolved.parent != images_dir and resolved.parent != markdown_file.parent and resolved.parent != destination_dir:
             return match.group(0)
         image_link = build_image_link(resolved.name, destination_dir, link_style)
         return f"![Description of image]({image_link})"
@@ -178,6 +263,7 @@ def main() -> None:
     markdown_output_dir = resolve_path(args.markdown_output_dir, base_dir) if args.markdown_output_dir else None
     current_date = date.today().strftime("%Y-%m-%d")
     link_style = args.link_style
+    source_mode = args.source_mode
 
     destination_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,15 +292,27 @@ def main() -> None:
 
         copied_for_file = False
         for reference in extract_image_references(text):
-            image_path = resolve_image_path(reference, markdown_file, images_dir, base_dir)
+            image_path = resolve_image_reference(
+                reference,
+                markdown_file,
+                images_dir,
+                destination_dir,
+                base_dir,
+                current_date,
+                source_mode,
+            )
             if image_path is None:
                 continue
 
-            if image_path.parent != images_dir and image_path.parent != markdown_file.parent:
+            if image_path.parent != images_dir and image_path.parent != markdown_file.parent and image_path.parent != destination_dir:
                 continue
 
             copied_for_file = True
             dest = destination_dir / image_path.name
+            if image_path.parent == destination_dir:
+                copied.append((display_path(markdown_file, base_dir), image_path.name))
+                continue
+
             if dest.exists():
                 skipped.append((display_path(markdown_file, base_dir), image_path.name, "already_exists"))
                 continue
@@ -226,7 +324,15 @@ def main() -> None:
         if copied_for_file:
             markdown_copy_path = build_markdown_copy_path(markdown_file, markdown_output_dir, current_date)
             if not markdown_copy_path.exists():
-                rewritten_text = rewrite_markdown_copy(text, markdown_file, images_dir, destination_dir, base_dir, link_style)
+                rewritten_text = rewrite_markdown_copy(
+                    text,
+                    markdown_file,
+                    images_dir,
+                    destination_dir,
+                    base_dir,
+                    link_style,
+                    current_date,
+                )
                 markdown_copy_path.parent.mkdir(parents=True, exist_ok=True)
                 markdown_copy_path.write_text(rewritten_text, encoding="utf-8")
                 markdown_copies.append((display_path(markdown_file, base_dir), markdown_copy_path.name))
